@@ -21,8 +21,8 @@ def run_60day_backfill():
             ticker_data['rs_slope'] = ticker_data['Close'].rolling(window=5).apply(
                 lambda x: np.polyfit(np.arange(5), x, 1)[0] if len(x) == 5 else np.nan
             )
-            # Fixed: no inplace=True
-            ticker_data['rs_slope'] = ticker_data['rs_slope'].fillna(0)
+            # Convert numpy float to Python float and fill NaN
+            ticker_data['rs_slope'] = ticker_data['rs_slope'].apply(lambda x: float(x) if not np.isnan(x) else 0.0)
 
             info = yf.Ticker(symbol).info
             short_f = float((info.get('shortPercentOfFloat', 0) or 0) * 100)
@@ -33,7 +33,7 @@ def run_60day_backfill():
                     ticker=symbol, date=ts.date(), price=float(row['Close']),
                     volume=int(row['Volume']), average_volume_30d=avg_v,
                     short_float_pct=short_f, rs_slope_5d=float(row['rs_slope']),
-                    sentiment_score=0.0, analyst_rating=0.0
+                    sentiment_score=0.0, analyst_rating=0.0, insider_score=0.0
                 )
                 stmt = stmt.on_conflict_do_update(
                     index_elements=['ticker', 'date'],

@@ -22,6 +22,7 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 Base = declarative_base()
 
+# --- EXISTING MODELS ---
 class DailyMetric(Base):
     __tablename__ = "daily_metrics"
     id = Column(Integer, primary_key=True)
@@ -62,8 +63,16 @@ class InsiderSignal(Base):
     value_num = Column(Float)
     is_cluster = Column(Boolean, default=False)
 
+# --- NEW MODEL FOR STORING DAILY SCOUT SCORES ---
+class ScoutScore(Base):
+    __tablename__ = "scout_scores"
+    ticker = Column(String, primary_key=True)
+    date = Column(Date, primary_key=True)
+    score = Column(Float)
+    action = Column(String)       # "STRONG BUY", "BUY", "WATCH", "HOLD"
+    signals = Column(String)      # comma-separated list of signals
 
-# --- TREND QUANTIZATION ---
+# --- TREND QUANTIZATION (unchanged) ---
 def analyze_rating_trend(ticker, session):
     """
     Analyzes 60 days of scores to find inflection points.
@@ -107,7 +116,7 @@ def analyze_rating_trend(ticker, session):
     return points, signals
 
 
-# --- CORE ALGORITHM ---
+# --- CORE ALGORITHM (unchanged) ---
 def calculate_scout_score(ticker, session):
     curr = session.query(DailyMetric).filter_by(ticker=ticker).order_by(DailyMetric.date.desc()).first()
     if not curr:
@@ -172,19 +181,45 @@ def init_db():
     Base.metadata.create_all(engine)
 
 
-# --- REPORT GENERATOR ---
+# --- REPORT GENERATOR + STORAGE ---
 if __name__ == "__main__":
-    init_db()
+    init_db()  # ensures all tables (including scout_scores) exist
     print(f"--- SCOUT REPORT (TRI-FACTOR REFINED): {datetime.now().strftime('%Y-%m-%d')} ---")
     session = SessionLocal()
     try:
+        # Get all unique tickers from daily_metrics (where we have price data)
         tickers = [t.ticker for t in session.query(DailyMetric.ticker).distinct().all()]
+        today = datetime.now().date()
+
         for t in tickers:
             try:
                 res = calculate_scout_score(t, session)
                 if res and res['score'] >= 40:
+                    # Print to console (existing functionality)
                     print(f"{res['action']} | {res['ticker']} | Score: {res['score']} | Signals: {res['signals']}")
+
+                    # ---- NEW: Store the computed score in the database ----
+                    from sqlalchemy.dialects.postgresql import insert
+                    stmt = insert(ScoutScore).values(
+                        ticker=t,
+                        date=today,
+                        score=res['score'],
+                        action=res['action'],
+                        signals=','.join(res['signals'])   # store list as comma string
+                    )
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=['ticker', 'date'],
+                        set_={
+                            'score': stmt.excluded.score,
+                            'action': stmt.excluded.action,
+                            'signals': stmt.excluded.signals
+                        }
+                    )
+                    session.execute(stmt)
             except Exception as e:
                 print(f"Error processing {t}: {e}")
+
+        session.commit()
+        print(f"\n✅ Scout scores stored for {today}.")
     finally:
         session.close()
