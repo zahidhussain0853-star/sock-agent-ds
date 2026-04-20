@@ -63,44 +63,32 @@ class InsiderSignal(Base):
     value_num = Column(Float)
     is_cluster = Column(Boolean, default=False)
 
-# --- NEW MODEL FOR STORING DAILY SCOUT SCORES ---
 class ScoutScore(Base):
     __tablename__ = "scout_scores"
     ticker = Column(String, primary_key=True)
     date = Column(Date, primary_key=True)
     score = Column(Float)
-    action = Column(String)       # "STRONG BUY", "BUY", "WATCH", "HOLD"
-    signals = Column(String)      # comma-separated list of signals
+    action = Column(String)
+    signals = Column(String)
 
 # --- TREND QUANTIZATION (unchanged) ---
 def analyze_rating_trend(ticker, session):
-    """
-    Analyzes 60 days of scores to find inflection points.
-    Returns: (points: int, signals: list)
-    """
     ratings = session.query(StockRating.score, StockRating.event)\
         .filter(StockRating.ticker == ticker)\
         .order_by(StockRating.date.desc())\
         .limit(60).all()
-
     if len(ratings) < 20:
         return 0, []
-
     scores = [r.score for r in reversed(ratings)]
     recent_event = next((r.event for r in ratings if r.event and r.event != "-"), None)
-
     x = np.arange(len(scores))
     y = np.array(scores)
-
     slope, _ = np.polyfit(x, y, 1)
-
     first_half_slope = np.polyfit(x[:45], y[:45], 1)[0] if len(x) > 45 else slope
-    recent_slope = np.polyfit(x[-15:], y[-15:], 1)[0]
+    recent_slope = np.polyfit(x[-15:], y[-15:], 1)[0] if len(x) >= 15 else slope
     acceleration = recent_slope - first_half_slope
-
     points = 0
     signals = []
-
     if slope > 0.001:
         if acceleration > 0.0005:
             points = 50
@@ -108,15 +96,12 @@ def analyze_rating_trend(ticker, session):
         else:
             points = 30
             signals.append("RATING_IMPROVING")
-
         if recent_event:
             points += 10
             signals.append(f"EVENT: {recent_event}")
-
     return points, signals
 
-
-# --- CORE ALGORITHM (unchanged) ---
+# --- CORE ALGORITHM (updated with sentiment) ---
 def calculate_scout_score(ticker, session):
     curr = session.query(DailyMetric).filter_by(ticker=ticker).order_by(DailyMetric.date.desc()).first()
     if not curr:
@@ -154,6 +139,22 @@ def calculate_scout_score(ticker, session):
         if curr.insider_alert_flag:
             signals.append(curr.insider_alert_flag)
 
+    # ENGINE 5: News Sentiment (new)
+    if curr.sentiment_score is not None:
+        s = curr.sentiment_score
+        if s > 0.3:
+            raw_score += 15
+            signals.append("POSITIVE_NEWS")
+        elif s < -0.3:
+            raw_score -= 10
+            signals.append("NEGATIVE_NEWS")
+        elif s > 0.1:
+            raw_score += 5
+            signals.append("SLIGHTLY_POSITIVE_NEWS")
+        elif s < -0.1:
+            raw_score -= 3
+            signals.append("SLIGHTLY_NEGATIVE_NEWS")
+
     # FINAL: Squeeze multiplier
     final_score = raw_score
     if curr.short_float_pct and curr.short_float_pct > 15:
@@ -161,13 +162,14 @@ def calculate_scout_score(ticker, session):
         signals.append("SQUEEZE_BOOST")
 
     # Threshold mapping
-    action = "❄️ HOLD"
     if final_score >= 80:
         action = "🔥 STRONG BUY"
     elif final_score >= 65:
         action = "✅ BUY"
     elif final_score >= 40:
         action = "👀 WATCH"
+    else:
+        action = "❄️ HOLD"
 
     return {
         "ticker": ticker,
@@ -176,36 +178,31 @@ def calculate_scout_score(ticker, session):
         "action": action
     }
 
-
 def init_db():
     Base.metadata.create_all(engine)
 
-
 # --- REPORT GENERATOR + STORAGE ---
 if __name__ == "__main__":
-    init_db()  # ensures all tables (including scout_scores) exist
+    init_db()
     print(f"--- SCOUT REPORT (TRI-FACTOR REFINED): {datetime.now().strftime('%Y-%m-%d')} ---")
     session = SessionLocal()
     try:
-        # Get all unique tickers from daily_metrics (where we have price data)
         tickers = [t.ticker for t in session.query(DailyMetric.ticker).distinct().all()]
         today = datetime.now().date()
-
         for t in tickers:
             try:
                 res = calculate_scout_score(t, session)
-                if res and res['score'] >= 40:
-                    # Print to console (existing functionality)
-                    print(f"{res['action']} | {res['ticker']} | Score: {res['score']} | Signals: {res['signals']}")
-
-                    # ---- NEW: Store the computed score in the database ----
+                if res:
+                    if res['score'] >= 40:
+                        print(f"{res['action']} | {res['ticker']} | Score: {res['score']} | Signals: {res['signals']}")
+                    # Store ALL scores (including below 40) for accurate averages
                     from sqlalchemy.dialects.postgresql import insert
                     stmt = insert(ScoutScore).values(
                         ticker=t,
                         date=today,
                         score=res['score'],
                         action=res['action'],
-                        signals=','.join(res['signals'])   # store list as comma string
+                        signals=','.join(res['signals'])
                     )
                     stmt = stmt.on_conflict_do_update(
                         index_elements=['ticker', 'date'],
@@ -218,7 +215,6 @@ if __name__ == "__main__":
                     session.execute(stmt)
             except Exception as e:
                 print(f"Error processing {t}: {e}")
-
         session.commit()
         print(f"\n✅ Scout scores stored for {today}.")
     finally:
