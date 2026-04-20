@@ -1,1 +1,1 @@
-worker: python daily_stock_ratings_update.py && daily_metrics_SP500_sync.py
+worker: python daily_stock_ratings_update.py && daily_metrics_sp500_sync.py
