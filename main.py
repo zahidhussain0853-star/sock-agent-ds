@@ -22,7 +22,7 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 Base = declarative_base()
 
-# --- MODELS ---
+# --- MODELS (with new columns) ---
 class DailyMetric(Base):
     __tablename__ = "daily_metrics"
     id = Column(Integer, primary_key=True)
@@ -39,6 +39,9 @@ class DailyMetric(Base):
     price = Column(Float)
     insider_score = Column(Float, default=0.0)
     insider_alert_flag = Column(String, nullable=True)
+    # NEW COLUMNS
+    rsi_14d = Column(Float, default=50.0)
+    macd_histogram = Column(Float, default=0.0)
 
 class StockRating(Base):
     __tablename__ = "stock_ratings"
@@ -78,60 +81,34 @@ class AnalystSlopeStat(Base):
     std_slope = Column(Float, default=0.0)
     last_updated = Column(Date, default=datetime.now().date)
 
-# --- ANALYST TREND FUNCTION (using pre‑computed statistics) ---
+# --- ANALYST TREND FUNCTION (unchanged, uses pre‑computed stats) ---
 def analyze_rating_trend(ticker, session):
-    """
-    Returns (points, signals) based on z-score of 60-day slope.
-    Uses pre-computed mean and std from analyst_slope_stats.
-    """
-    # Get current 60-day slope
     ratings = session.query(StockRating.score, StockRating.event)\
         .filter(StockRating.ticker == ticker)\
         .order_by(StockRating.date.desc())\
         .limit(60).all()
-    
     if len(ratings) < 20:
         return 0, []
-    
     scores = [r.score for r in reversed(ratings)]
     x = np.arange(len(scores))
     y = np.array(scores)
     current_slope = np.polyfit(x, y, 1)[0]
-    
-    # Retrieve pre‑computed statistics
     stat = session.query(AnalystSlopeStat).filter(AnalystSlopeStat.ticker == ticker).first()
-    
     if stat and stat.std_slope > 0:
         z_score = (current_slope - stat.mean_slope) / stat.std_slope
     else:
-        # Fallback to raw slope if no stats available
         if current_slope > 0.001:
-            points = 30
-            signals = ["RATING_IMPROVING"]
+            return 30, ["RATING_IMPROVING"]
         else:
-            points = 0
-            signals = []
-        # Simple acceleration check (optional fallback)
-        if len(scores) >= 60:
-            first_half_slope = np.polyfit(x[:45], y[:45], 1)[0]
-            recent_slope = np.polyfit(x[-15:], y[-15:], 1)[0]
-            if recent_slope - first_half_slope > 0.0005:
-                points += 10
-                signals.append("RATING_ACCELERATION_BOOST")
-        return points, signals
-
+            return 0, []
     points = 0
     signals = []
-    
-    # Acceleration (recent 15-day vs. first 45-day)
     if len(scores) >= 60:
         first_half_slope = np.polyfit(x[:45], y[:45], 1)[0]
         recent_slope = np.polyfit(x[-15:], y[-15:], 1)[0]
         acceleration = recent_slope - first_half_slope
     else:
         acceleration = 0
-
-    # Assign points based on z-score
     if z_score > 2.0:
         points = 50
         signals.append("RATING_ACCELERATING")
@@ -141,23 +118,16 @@ def analyze_rating_trend(ticker, session):
     elif z_score > 0:
         points = 15
         signals.append("RATING_SLIGHTLY_IMPROVING")
-    else:
-        points = 0
-
-    # Acceleration bonus
     if acceleration > 0.0005 and z_score > 1.0:
         points += 10
         signals.append("RATING_ACCELERATION_BOOST")
-
-    # Recent analyst event bonus
     recent_event = next((r.event for r in ratings if r.event and r.event != "-"), None)
     if recent_event:
         points += 10
         signals.append(f"EVENT: {recent_event}")
-
     return points, signals
 
-# --- CORE SCORING FUNCTIONS (unchanged logic, but use the new analyst trend) ---
+# --- CORE SCORING FUNCTIONS (with RSI and MACD) ---
 def calculate_scout_score(ticker, session):
     curr = session.query(DailyMetric).filter_by(ticker=ticker).order_by(DailyMetric.date.desc()).first()
     if not curr:
@@ -166,7 +136,7 @@ def calculate_scout_score(ticker, session):
     raw_score = 0
     signals = []
 
-    # ENGINE 1: Analyst Velocity (uses updated analyze_rating_trend)
+    # ENGINE 1: Analyst Velocity
     rating_points, rating_signals = analyze_rating_trend(ticker, session)
     raw_score += rating_points
     signals.extend(rating_signals)
@@ -179,12 +149,12 @@ def calculate_scout_score(ticker, session):
         raw_score -= 20
         signals.append("BEARISH_DIVERGENCE")
 
-    # ENGINE 2b: 20‑day RS Slope (new)
+    # ENGINE 2b: 20‑day RS Slope
     price_rows = session.query(DailyMetric.price).filter(
         DailyMetric.ticker == ticker,
         DailyMetric.date <= curr.date
     ).order_by(DailyMetric.date.desc()).limit(20).all()
-    prices = [p[0] for p in reversed(price_rows)]  # oldest to newest
+    prices = [p[0] for p in reversed(price_rows)]
     if len(prices) >= 10:
         x = np.arange(len(prices))
         twenty_day_slope = np.polyfit(x, prices, 1)[0]
@@ -224,13 +194,31 @@ def calculate_scout_score(ticker, session):
             raw_score -= 3
             signals.append("SLIGHTLY_NEGATIVE_NEWS")
 
+    # ENGINE 6: RSI (NEW)
+    if curr.rsi_14d is not None:
+        if curr.rsi_14d < 30:
+            raw_score += 15
+            signals.append("RSI_OVERSOLD")
+        elif curr.rsi_14d > 70:
+            raw_score -= 10
+            signals.append("RSI_OVERBOUGHT")
+
+    # ENGINE 7: MACD Histogram (NEW)
+    if curr.macd_histogram is not None:
+        if curr.macd_histogram > 0:
+            raw_score += 20
+            signals.append("MACD_BULLISH")
+        else:
+            raw_score -= 10
+            signals.append("MACD_BEARISH")
+
     # SQUEEZE MULTIPLIER
     final_score = raw_score
     if curr.short_float_pct and curr.short_float_pct > 15:
         final_score *= 1.2
         signals.append("SQUEEZE_BOOST")
 
-    # Optional: cap score at 100 (uncomment if desired)
+    # Optional cap at 100
     # final_score = min(final_score, 100)
 
     if final_score >= 80:
@@ -250,11 +238,7 @@ def calculate_scout_score(ticker, session):
     }
 
 def calculate_scout_score_for_date(ticker, target_date, session):
-    """
-    Calculate scout score as of a specific date (for backfill).
-    Uses daily_metrics and stock_ratings up to that date.
-    """
-    # Get daily metric for that exact date
+    """Same as above but for a specific historical date (for backfill)."""
     curr = session.query(DailyMetric).filter(
         DailyMetric.ticker == ticker,
         DailyMetric.date == target_date
@@ -265,64 +249,48 @@ def calculate_scout_score_for_date(ticker, target_date, session):
     raw_score = 0
     signals = []
 
-    # --- Analyst ratings up to target_date ---
+    # Analyst trend (simplified for backfill; use pre‑computed stats if available)
     ratings = session.query(StockRating.score, StockRating.event)\
         .filter(StockRating.ticker == ticker, StockRating.date <= target_date)\
         .order_by(StockRating.date.desc())\
         .limit(60).all()
-    
-    rating_points = 0
-    rating_signals = []
     if len(ratings) >= 20:
         scores = [r.score for r in reversed(ratings)]
-        recent_event = next((r.event for r in ratings if r.event and r.event != "-"), None)
         x = np.arange(len(scores))
         y = np.array(scores)
         current_slope = np.polyfit(x, y, 1)[0]
-        
-        # Use pre‑computed stats if available
         stat = session.query(AnalystSlopeStat).filter(AnalystSlopeStat.ticker == ticker).first()
         if stat and stat.std_slope > 0:
             z_score = (current_slope - stat.mean_slope) / stat.std_slope
         else:
             z_score = None
-
         if stat and z_score is not None:
             if z_score > 2.0:
-                rating_points = 50
-                rating_signals.append("RATING_ACCELERATING")
+                raw_score += 50
+                signals.append("RATING_ACCELERATING")
             elif z_score > 1.0:
-                rating_points = 30
-                rating_signals.append("RATING_IMPROVING")
+                raw_score += 30
+                signals.append("RATING_IMPROVING")
             elif z_score > 0:
-                rating_points = 15
-                rating_signals.append("RATING_SLIGHTLY_IMPROVING")
-            else:
-                rating_points = 0
+                raw_score += 15
+                signals.append("RATING_SLIGHTLY_IMPROVING")
         else:
-            # Fallback to raw slope
             if current_slope > 0.001:
-                rating_points = 30
-                rating_signals.append("RATING_IMPROVING")
-            else:
-                rating_points = 0
-        
-        # Acceleration (only if we have enough data)
+                raw_score += 30
+                signals.append("RATING_IMPROVING")
+        # acceleration
         if len(scores) >= 60:
             first_half_slope = np.polyfit(x[:45], y[:45], 1)[0]
             recent_slope = np.polyfit(x[-15:], y[-15:], 1)[0]
             if recent_slope - first_half_slope > 0.0005:
-                rating_points += 10
-                rating_signals.append("RATING_ACCELERATION_BOOST")
-        
+                raw_score += 10
+                signals.append("RATING_ACCELERATION_BOOST")
+        recent_event = next((r.event for r in ratings if r.event and r.event != "-"), None)
         if recent_event:
-            rating_points += 10
-            rating_signals.append(f"EVENT: {recent_event}")
-    
-    raw_score += rating_points
-    signals.extend(rating_signals)
+            raw_score += 10
+            signals.append(f"EVENT: {recent_event}")
 
-    # --- 5‑day slope ---
+    # 5-day slope
     if curr.rs_slope_5d and curr.rs_slope_5d > 0:
         raw_score += 25
         signals.append("POSITIVE_TREND_CONFIRMED")
@@ -330,7 +298,7 @@ def calculate_scout_score_for_date(ticker, target_date, session):
         raw_score -= 20
         signals.append("BEARISH_DIVERGENCE")
 
-    # --- 20‑day slope (compute from historical prices up to target_date) ---
+    # 20-day slope
     price_rows = session.query(DailyMetric.price).filter(
         DailyMetric.ticker == ticker,
         DailyMetric.date <= target_date
@@ -343,7 +311,7 @@ def calculate_scout_score_for_date(ticker, target_date, session):
             raw_score += 15
             signals.append("LONG_TERM_MOMENTUM")
 
-    # --- RVOL ---
+    # RVOL
     if curr.average_volume_30d and curr.average_volume_30d > 0:
         rvol = curr.volume / curr.average_volume_30d
         if rvol > 2.0:
@@ -353,13 +321,13 @@ def calculate_scout_score_for_date(ticker, target_date, session):
             raw_score += 25
             signals.append("VOLUME_MOMENTUM")
 
-    # --- Insider ---
+    # Insider
     if curr.insider_score and curr.insider_score > 0:
         raw_score += curr.insider_score
         if curr.insider_alert_flag:
             signals.append(curr.insider_alert_flag)
 
-    # --- Sentiment ---
+    # Sentiment
     if curr.sentiment_score is not None:
         s = curr.sentiment_score
         if s > 0.3:
@@ -375,7 +343,25 @@ def calculate_scout_score_for_date(ticker, target_date, session):
             raw_score -= 3
             signals.append("SLIGHTLY_NEGATIVE_NEWS")
 
-    # --- Squeeze multiplier ---
+    # RSI (NEW)
+    if curr.rsi_14d is not None:
+        if curr.rsi_14d < 30:
+            raw_score += 15
+            signals.append("RSI_OVERSOLD")
+        elif curr.rsi_14d > 70:
+            raw_score -= 10
+            signals.append("RSI_OVERBOUGHT")
+
+    # MACD (NEW)
+    if curr.macd_histogram is not None:
+        if curr.macd_histogram > 0:
+            raw_score += 20
+            signals.append("MACD_BULLISH")
+        else:
+            raw_score -= 10
+            signals.append("MACD_BEARISH")
+
+    # Squeeze multiplier
     final_score = raw_score
     if curr.short_float_pct and curr.short_float_pct > 15:
         final_score *= 1.2
@@ -417,7 +403,7 @@ if __name__ == "__main__":
                 if res:
                     if res['score'] >= 40:
                         print(f"{res['action']} | {res['ticker']} | Score: {res['score']} | Signals: {res['signals']}")
-                    # Store ALL scores (including <40) for accurate averages
+                    # Store ALL scores
                     from sqlalchemy.dialects.postgresql import insert
                     stmt = insert(ScoutScore).values(
                         ticker=t,
