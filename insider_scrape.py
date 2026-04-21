@@ -2,6 +2,7 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime
+from time import sleep
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from main import InsiderSignal
@@ -12,6 +13,23 @@ load_dotenv()
 DATABASE_URL = normalize_db_url()
 engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
+
+def fetch_with_retry(url, headers, timeout=30, retries=3):
+    """Fetch URL with retries and exponential backoff."""
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.Timeout:
+            print(f"Timeout (attempt {attempt+1}/{retries}), retrying in {2**attempt}s...")
+            sleep(2**attempt)
+        except Exception as e:
+            print(f"Request error: {e}")
+            if attempt == retries - 1:
+                raise
+            sleep(2**attempt)
+    raise Exception(f"Failed to fetch after {retries} attempts")
 
 def scrape_to_railway():
     """
@@ -26,8 +44,7 @@ def scrape_to_railway():
     
     session = None
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
+        response = fetch_with_retry(url, headers, timeout=30, retries=3)
         
         soup = BeautifulSoup(response.text, 'html.parser')
         table = soup.find('table', {'class': 'tinytable'})
