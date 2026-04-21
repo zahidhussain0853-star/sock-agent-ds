@@ -8,7 +8,6 @@ from main import InsiderSignal
 from utils import normalize_db_url
 from dotenv import load_dotenv
 
-# Load environment variables and setup database
 load_dotenv()
 DATABASE_URL = normalize_db_url()
 engine = create_engine(DATABASE_URL)
@@ -25,6 +24,7 @@ def scrape_to_railway():
 
     print(f"--- STARTING INSIDER SYNC: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---")
     
+    session = None
     try:
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
@@ -39,7 +39,6 @@ def scrape_to_railway():
         session = Session()
         rows_added = 0
         
-        # Identify clusters in this batch (Tickers appearing multiple times)
         all_tr = table.find_all('tr')[1:]
         batch_tickers = [tr.find_all('td')[3].text.strip() for tr in all_tr if len(tr.find_all('td')) > 3]
         ticker_counts = pd.Series(batch_tickers).value_counts()
@@ -52,7 +51,6 @@ def scrape_to_railway():
             ticker = cols[3].text.strip()
             trade_date_str = cols[2].text.strip()
             
-            # Clean the numeric percentage (e.g., '+22%' -> 22.0)
             raw_change = cols[11].text.strip()
             change_val = 0.0
             if '%' in raw_change:
@@ -61,14 +59,12 @@ def scrape_to_railway():
                 except ValueError:
                     change_val = 0.0
 
-            # Clean the value (e.g., '$1,234,567' -> 1234567.0)
             raw_value = cols[10].text.strip()
             try:
                 value_num = float(raw_value.replace('$', '').replace(',', ''))
             except ValueError:
                 value_num = 0.0
 
-            # Map to SQLAlchemy Model
             signal = InsiderSignal(
                 ticker=ticker,
                 date=datetime.strptime(trade_date_str, '%Y-%m-%d').date(),
@@ -79,7 +75,6 @@ def scrape_to_railway():
                 is_cluster=bool(ticker_counts.get(ticker, 0) >= 3)
             )
 
-            # session.merge handles the (ticker, date) primary key conflict
             session.merge(signal)
             rows_added += 1
 
@@ -88,8 +83,11 @@ def scrape_to_railway():
         
     except Exception as e:
         print(f"❌ Scraper/Sync Error: {e}")
+        if session:
+            session.rollback()
     finally:
-        session.close()
+        if session:
+            session.close()
 
 if __name__ == "__main__":
     scrape_to_railway()
