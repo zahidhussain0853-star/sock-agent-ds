@@ -81,6 +81,24 @@ class AnalystSlopeStat(Base):
     std_slope = Column(Float, default=0.0)
     last_updated = Column(Date, default=datetime.now().date)
 
+class TradeSignal(Base):
+    __tablename__ = "trade_signals"
+    id = Column(Integer, primary_key=True)
+    ticker = Column(String)
+    signal_date = Column(Date)
+    signal_type = Column(String)   # 'BUY' or 'SELL'
+    score_at_signal = Column(Float, nullable=True)
+    price_at_signal = Column(Float)
+    buy_signal_id = Column(Integer, nullable=True)
+    exit_reason = Column(String, nullable=True)
+    entry_date = Column(Date, nullable=True)
+    exit_date = Column(Date, nullable=True)
+    exit_price = Column(Float, nullable=True)
+    status = Column(String, default='OPEN')
+    forward_5d_return = Column(Float, nullable=True)
+    forward_10d_return = Column(Float, nullable=True)
+    peak_price_since_buy = Column(Float, nullable=True)
+    
 # --- ANALYST TREND FUNCTION (unchanged, uses pre‑computed stats) ---
 def analyze_rating_trend(ticker, session):
     ratings = session.query(StockRating.score, StockRating.event)\

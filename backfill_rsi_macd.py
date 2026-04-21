@@ -1,8 +1,8 @@
 # backfill_rsi_macd.py
 from main import SessionLocal, DailyMetric
-from datetime import timedelta
 import numpy as np
 import pandas as pd
+import time
 
 def compute_rsi(prices, period=14):
     if len(prices) < period + 1:
@@ -32,27 +32,44 @@ def compute_macd(prices, fast=12, slow=26, signal=9):
 def backfill():
     session = SessionLocal()
     tickers = [t[0] for t in session.query(DailyMetric.ticker).distinct().all()]
-    for ticker in tickers:
-        print(f"Processing {ticker}...")
-        rows = session.query(DailyMetric).filter(DailyMetric.ticker == ticker).order_by(DailyMetric.date).all()
-        if len(rows) < 15:
-            continue
-        prices = [row.price for row in rows]
-        # Compute RSI and MACD for each row (needs lookback)
-        for i, row in enumerate(rows):
-            # For RSI and MACD, use prices up to current index
-            window = prices[:i+1]
-            if len(window) >= 14:
-                rsi = compute_rsi(window)
-                macd = compute_macd(window)
-                row.rsi_14d = rsi
-                row.macd_histogram = macd
-            else:
-                row.rsi_14d = 50.0
-                row.macd_histogram = 0.0
-        session.commit()
-        print(f"  Done {ticker}")
     session.close()
+
+    for ticker in tickers:
+        retries = 3
+        for attempt in range(retries):
+            try:
+                session = SessionLocal()
+                print(f"Processing {ticker}...")
+                rows = session.query(DailyMetric).filter(DailyMetric.ticker == ticker).order_by(DailyMetric.date).all()
+                if len(rows) < 15:
+                    session.close()
+                    break
+                prices = [row.price for row in rows]
+                # Update each row's RSI and MACD
+                for i, row in enumerate(rows):
+                    window = prices[:i+1]
+                    if len(window) >= 14:
+                        rsi = compute_rsi(window)
+                        macd = compute_macd(window)
+                    else:
+                        rsi = 50.0
+                        macd = 0.0
+                    row.rsi_14d = rsi
+                    row.macd_histogram = macd
+                session.commit()
+                print(f"  Updated {len(rows)} rows for {ticker}")
+                session.close()
+                break  # success, exit retry loop
+            except Exception as e:
+                print(f"  Error on {ticker} (attempt {attempt+1}/{retries}): {e}")
+                if session:
+                    session.rollback()
+                    session.close()
+                if attempt < retries - 1:
+                    time.sleep(5)
+                else:
+                    print(f"  Failed to process {ticker} after {retries} attempts. Skipping.")
+    print("✅ Backfill complete.")
 
 if __name__ == "__main__":
     backfill()
