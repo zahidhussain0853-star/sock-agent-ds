@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sqlalchemy import create_engine
 from utils import normalize_db_url
 from main import SessionLocal, analyze_rating_trend, DailyMetric
@@ -96,7 +97,7 @@ def load_analyst_history(ticker):
 st.title("📈 Scout Stock Dashboard")
 tab1, tab2 = st.tabs(["Overview", "Signal Breakdown"])
 
-# ---------- Tab 1: Overview (same as last working version) ----------
+# ---------- Tab 1: Overview ----------
 with tab1:
     @st.cache_data(ttl=3600)
     def load_latest_data():
@@ -199,7 +200,7 @@ with tab1:
         else:
             st.info("No historical data for this ticker.")
 
-# ---------- Tab 2: Signal Breakdown (with improved y‑axis) ----------
+# ---------- Tab 2: Signal Breakdown ----------
 with tab2:
     st.subheader("🔍 Deconstruct the Scout Score")
     ticker_list2 = df_latest['ticker'].unique() if 'df_latest' in locals() else []
@@ -231,55 +232,70 @@ with tab2:
         st.plotly_chart(fig_bar, width='stretch')
         st.caption("Analyst Trend: max 60; RS Slope: +25 (positive) / -20 (negative); RVOL: +40 (>2.0) / +25 (1.5-2.0); Insider: variable.")
 
+        # --- Combined Analyst Graph (dual axis) with larger event labels ---
         st.markdown("### 📈 Analyst Rating Evolution")
         analyst_hist = load_analyst_history(selected2)
         if not analyst_hist.empty:
-            left_col, right_col = st.columns(2)
-            with left_col:
-                fig_analyst = go.Figure()
-                fig_analyst.add_trace(go.Scatter(
-                    x=analyst_hist['date'], y=analyst_hist['score'],
-                    mode='lines+markers', name='Analyst Score (1-5)',
-                    line=dict(color='purple', width=2), marker=dict(size=6)
-                ))
-                events_df = load_analyst_events(selected2)
-                for _, row in events_df.iterrows():
-                    fig_analyst.add_vline(x=row['date'], line_dash="dot", line_color="red", line_width=1)
-                    fig_analyst.add_annotation(
-                        x=row['date'], y=5.0,
-                        text=row['event'][:30], showarrow=False,
-                        textangle=-90, font=dict(size=9, color='red')
-                    )
-                fig_analyst.update_layout(
-                    title="Weighted Analyst Score (1=Strong Buy → 5=Strong Sell)",
-                    xaxis_title="Date", yaxis_title="Score",
-                    yaxis=dict(
-                        tickmode='linear',
-                        tick0=1.0,
-                        dtick=0.5,                # cleaner y‑axis labels
-                        range=[1,5],
-                        tickfont=dict(size=12)
-                    ),
-                    xaxis=dict(tickangle=-45, tickfont=dict(size=10)),
-                    height=400
+            fig_combined = make_subplots(specs=[[{"secondary_y": True}]])
+
+            # Analyst score (left axis)
+            fig_combined.add_trace(
+                go.Scatter(
+                    x=analyst_hist['date'],
+                    y=analyst_hist['score'],
+                    mode='lines+markers',
+                    name='Analyst Score (1-5)',
+                    line=dict(color='purple', width=2),
+                    marker=dict(size=6, color='purple')
+                ),
+                secondary_y=False
+            )
+
+            # Number of analysts (right axis)
+            fig_combined.add_trace(
+                go.Scatter(
+                    x=analyst_hist['date'],
+                    y=analyst_hist['total_analysts'],
+                    mode='lines+markers',
+                    name='Number of Analysts',
+                    line=dict(color='blue', width=2, dash='dot'),
+                    marker=dict(size=5, color='blue')
+                ),
+                secondary_y=True
+            )
+
+            # Event vertical lines & larger horizontal annotations
+            events_df = load_analyst_events(selected2)
+            for _, row in events_df.iterrows():
+                fig_combined.add_vline(
+                    x=row['date'], line_dash="dot", line_color="red", line_width=1,
+                    secondary_y=False
                 )
-                st.plotly_chart(fig_analyst, use_container_width=True)
-            
-            with right_col:
-                fig_count = go.Figure()
-                fig_count.add_trace(go.Bar(x=analyst_hist['date'], y=analyst_hist['total_analysts'], name='Total Analysts', marker_color='lightblue'))
-                fig_count.update_layout(
-                    title="Number of Analysts Reporting",
-                    xaxis_title="Date", yaxis_title="Count",
-                    yaxis=dict(tickfont=dict(size=12)),
-                    xaxis=dict(tickangle=-45, tickfont=dict(size=10)),
-                    height=400
+                fig_combined.add_annotation(
+                    x=row['date'], y=5.4,
+                    text=row['event'][:35], showarrow=False,
+                    textangle=0, font=dict(size=12, color='red'),
+                    bgcolor='rgba(255,255,255,0.85)'
                 )
-                st.plotly_chart(fig_count, use_container_width=True)
+
+            fig_combined.update_layout(
+                title=f"{selected2} Analyst Rating & Coverage",
+                xaxis_title="Date",
+                yaxis_title="Analyst Score (1=Strong Buy → 5=Strong Sell)",
+                yaxis2_title="Number of Analysts Reporting",
+                yaxis=dict(tickmode='linear', tick0=1, dtick=0.5, range=[1,5.8], tickfont=dict(size=11)),
+                yaxis2=dict(tickfont=dict(size=11), showgrid=False),
+                xaxis=dict(tickangle=-45, tickfont=dict(size=10)),
+                height=500,
+                legend=dict(x=0.02, y=0.98, bgcolor='rgba(255,255,255,0.8)')
+            )
+
+            st.plotly_chart(fig_combined, use_container_width=True)
             st.caption("Red vertical lines mark upgrade/downgrade events. Analyst score is weighted average (1-5).")
         else:
             st.info("No analyst rating history found for this ticker.")
 
+        # --- Scout Score History ---
         st.markdown("### 🎯 Scout Score History")
         ts_df = load_ticker_timeseries(selected2)
         if not ts_df.empty:
@@ -292,6 +308,7 @@ with tab2:
         else:
             st.info("No scout score history available.")
 
+        # --- Other Historical Metrics ---
         st.markdown("### 📉 Other Historical Metrics")
         if not ts_df.empty:
             fig_dual = go.Figure()

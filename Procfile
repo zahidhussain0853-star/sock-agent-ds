@@ -1,1 +1,1 @@
-sock_agent_ds: python daily_stock_ratings_update.py && daily_metrics_sp500_sync.py
+sock_agent_ds: python daily_stock_ratings_update.py && daily_metrics_sp500_sync.py && main.py
