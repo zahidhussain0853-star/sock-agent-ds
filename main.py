@@ -2,7 +2,7 @@ import os
 import numpy as np
 from sqlalchemy import create_engine, Column, Integer, String, Date, Float, Boolean, BigInteger
 from sqlalchemy.orm import sessionmaker, declarative_base
-from datetime import datetime, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 from utils import normalize_db_url
 
@@ -71,37 +71,93 @@ class ScoutScore(Base):
     action = Column(String)
     signals = Column(String)
 
-# --- HELPER: ANALYST TREND (unchanged) ---
+class AnalystSlopeStat(Base):
+    __tablename__ = "analyst_slope_stats"
+    ticker = Column(String, primary_key=True)
+    mean_slope = Column(Float, default=0.0)
+    std_slope = Column(Float, default=0.0)
+    last_updated = Column(Date, default=datetime.now().date)
+
+# --- ANALYST TREND FUNCTION (using pre‑computed statistics) ---
 def analyze_rating_trend(ticker, session):
+    """
+    Returns (points, signals) based on z-score of 60-day slope.
+    Uses pre-computed mean and std from analyst_slope_stats.
+    """
+    # Get current 60-day slope
     ratings = session.query(StockRating.score, StockRating.event)\
         .filter(StockRating.ticker == ticker)\
         .order_by(StockRating.date.desc())\
         .limit(60).all()
+    
     if len(ratings) < 20:
         return 0, []
+    
     scores = [r.score for r in reversed(ratings)]
-    recent_event = next((r.event for r in ratings if r.event and r.event != "-"), None)
     x = np.arange(len(scores))
     y = np.array(scores)
-    slope, _ = np.polyfit(x, y, 1)
-    first_half_slope = np.polyfit(x[:45], y[:45], 1)[0] if len(x) > 45 else slope
-    recent_slope = np.polyfit(x[-15:], y[-15:], 1)[0] if len(x) >= 15 else slope
-    acceleration = recent_slope - first_half_slope
+    current_slope = np.polyfit(x, y, 1)[0]
+    
+    # Retrieve pre‑computed statistics
+    stat = session.query(AnalystSlopeStat).filter(AnalystSlopeStat.ticker == ticker).first()
+    
+    if stat and stat.std_slope > 0:
+        z_score = (current_slope - stat.mean_slope) / stat.std_slope
+    else:
+        # Fallback to raw slope if no stats available
+        if current_slope > 0.001:
+            points = 30
+            signals = ["RATING_IMPROVING"]
+        else:
+            points = 0
+            signals = []
+        # Simple acceleration check (optional fallback)
+        if len(scores) >= 60:
+            first_half_slope = np.polyfit(x[:45], y[:45], 1)[0]
+            recent_slope = np.polyfit(x[-15:], y[-15:], 1)[0]
+            if recent_slope - first_half_slope > 0.0005:
+                points += 10
+                signals.append("RATING_ACCELERATION_BOOST")
+        return points, signals
+
     points = 0
     signals = []
-    if slope > 0.001:
-        if acceleration > 0.0005:
-            points = 50
-            signals.append("RATING_ACCELERATING")
-        else:
-            points = 30
-            signals.append("RATING_IMPROVING")
-        if recent_event:
-            points += 10
-            signals.append(f"EVENT: {recent_event}")
+    
+    # Acceleration (recent 15-day vs. first 45-day)
+    if len(scores) >= 60:
+        first_half_slope = np.polyfit(x[:45], y[:45], 1)[0]
+        recent_slope = np.polyfit(x[-15:], y[-15:], 1)[0]
+        acceleration = recent_slope - first_half_slope
+    else:
+        acceleration = 0
+
+    # Assign points based on z-score
+    if z_score > 2.0:
+        points = 50
+        signals.append("RATING_ACCELERATING")
+    elif z_score > 1.0:
+        points = 30
+        signals.append("RATING_IMPROVING")
+    elif z_score > 0:
+        points = 15
+        signals.append("RATING_SLIGHTLY_IMPROVING")
+    else:
+        points = 0
+
+    # Acceleration bonus
+    if acceleration > 0.0005 and z_score > 1.0:
+        points += 10
+        signals.append("RATING_ACCELERATION_BOOST")
+
+    # Recent analyst event bonus
+    recent_event = next((r.event for r in ratings if r.event and r.event != "-"), None)
+    if recent_event:
+        points += 10
+        signals.append(f"EVENT: {recent_event}")
+
     return points, signals
 
-# --- CORE SCORING FUNCTIONS (with 20‑day slope) ---
+# --- CORE SCORING FUNCTIONS (unchanged logic, but use the new analyst trend) ---
 def calculate_scout_score(ticker, session):
     curr = session.query(DailyMetric).filter_by(ticker=ticker).order_by(DailyMetric.date.desc()).first()
     if not curr:
@@ -110,7 +166,7 @@ def calculate_scout_score(ticker, session):
     raw_score = 0
     signals = []
 
-    # ENGINE 1: Analyst Velocity
+    # ENGINE 1: Analyst Velocity (uses updated analyze_rating_trend)
     rating_points, rating_signals = analyze_rating_trend(ticker, session)
     raw_score += rating_points
     signals.extend(rating_signals)
@@ -168,13 +224,15 @@ def calculate_scout_score(ticker, session):
             raw_score -= 3
             signals.append("SLIGHTLY_NEGATIVE_NEWS")
 
-    # Squeeze multiplier
+    # SQUEEZE MULTIPLIER
     final_score = raw_score
     if curr.short_float_pct and curr.short_float_pct > 15:
         final_score *= 1.2
         signals.append("SQUEEZE_BOOST")
 
-    # Action mapping
+    # Optional: cap score at 100 (uncomment if desired)
+    # final_score = min(final_score, 100)
+
     if final_score >= 80:
         action = "🔥 STRONG BUY"
     elif final_score >= 65:
@@ -196,6 +254,7 @@ def calculate_scout_score_for_date(ticker, target_date, session):
     Calculate scout score as of a specific date (for backfill).
     Uses daily_metrics and stock_ratings up to that date.
     """
+    # Get daily metric for that exact date
     curr = session.query(DailyMetric).filter(
         DailyMetric.ticker == ticker,
         DailyMetric.date == target_date
@@ -206,11 +265,12 @@ def calculate_scout_score_for_date(ticker, target_date, session):
     raw_score = 0
     signals = []
 
-    # Analyst ratings up to target_date
+    # --- Analyst ratings up to target_date ---
     ratings = session.query(StockRating.score, StockRating.event)\
         .filter(StockRating.ticker == ticker, StockRating.date <= target_date)\
         .order_by(StockRating.date.desc())\
         .limit(60).all()
+    
     rating_points = 0
     rating_signals = []
     if len(ratings) >= 20:
@@ -218,24 +278,51 @@ def calculate_scout_score_for_date(ticker, target_date, session):
         recent_event = next((r.event for r in ratings if r.event and r.event != "-"), None)
         x = np.arange(len(scores))
         y = np.array(scores)
-        slope, _ = np.polyfit(x, y, 1)
-        first_half_slope = np.polyfit(x[:45], y[:45], 1)[0] if len(x) > 45 else slope
-        recent_slope = np.polyfit(x[-15:], y[-15:], 1)[0] if len(x) >= 15 else slope
-        acceleration = recent_slope - first_half_slope
-        if slope > 0.001:
-            if acceleration > 0.0005:
+        current_slope = np.polyfit(x, y, 1)[0]
+        
+        # Use pre‑computed stats if available
+        stat = session.query(AnalystSlopeStat).filter(AnalystSlopeStat.ticker == ticker).first()
+        if stat and stat.std_slope > 0:
+            z_score = (current_slope - stat.mean_slope) / stat.std_slope
+        else:
+            z_score = None
+
+        if stat and z_score is not None:
+            if z_score > 2.0:
                 rating_points = 50
                 rating_signals.append("RATING_ACCELERATING")
-            else:
+            elif z_score > 1.0:
                 rating_points = 30
                 rating_signals.append("RATING_IMPROVING")
-            if recent_event:
+            elif z_score > 0:
+                rating_points = 15
+                rating_signals.append("RATING_SLIGHTLY_IMPROVING")
+            else:
+                rating_points = 0
+        else:
+            # Fallback to raw slope
+            if current_slope > 0.001:
+                rating_points = 30
+                rating_signals.append("RATING_IMPROVING")
+            else:
+                rating_points = 0
+        
+        # Acceleration (only if we have enough data)
+        if len(scores) >= 60:
+            first_half_slope = np.polyfit(x[:45], y[:45], 1)[0]
+            recent_slope = np.polyfit(x[-15:], y[-15:], 1)[0]
+            if recent_slope - first_half_slope > 0.0005:
                 rating_points += 10
-                rating_signals.append(f"EVENT: {recent_event}")
+                rating_signals.append("RATING_ACCELERATION_BOOST")
+        
+        if recent_event:
+            rating_points += 10
+            rating_signals.append(f"EVENT: {recent_event}")
+    
     raw_score += rating_points
     signals.extend(rating_signals)
 
-    # 5‑day slope (already stored)
+    # --- 5‑day slope ---
     if curr.rs_slope_5d and curr.rs_slope_5d > 0:
         raw_score += 25
         signals.append("POSITIVE_TREND_CONFIRMED")
@@ -243,7 +330,7 @@ def calculate_scout_score_for_date(ticker, target_date, session):
         raw_score -= 20
         signals.append("BEARISH_DIVERGENCE")
 
-    # 20‑day slope (compute from historical prices up to target_date)
+    # --- 20‑day slope (compute from historical prices up to target_date) ---
     price_rows = session.query(DailyMetric.price).filter(
         DailyMetric.ticker == ticker,
         DailyMetric.date <= target_date
@@ -256,7 +343,7 @@ def calculate_scout_score_for_date(ticker, target_date, session):
             raw_score += 15
             signals.append("LONG_TERM_MOMENTUM")
 
-    # RVOL
+    # --- RVOL ---
     if curr.average_volume_30d and curr.average_volume_30d > 0:
         rvol = curr.volume / curr.average_volume_30d
         if rvol > 2.0:
@@ -266,13 +353,13 @@ def calculate_scout_score_for_date(ticker, target_date, session):
             raw_score += 25
             signals.append("VOLUME_MOMENTUM")
 
-    # Insider
+    # --- Insider ---
     if curr.insider_score and curr.insider_score > 0:
         raw_score += curr.insider_score
         if curr.insider_alert_flag:
             signals.append(curr.insider_alert_flag)
 
-    # Sentiment
+    # --- Sentiment ---
     if curr.sentiment_score is not None:
         s = curr.sentiment_score
         if s > 0.3:
@@ -288,13 +375,15 @@ def calculate_scout_score_for_date(ticker, target_date, session):
             raw_score -= 3
             signals.append("SLIGHTLY_NEGATIVE_NEWS")
 
-    # Squeeze multiplier
+    # --- Squeeze multiplier ---
     final_score = raw_score
     if curr.short_float_pct and curr.short_float_pct > 15:
         final_score *= 1.2
         signals.append("SQUEEZE_BOOST")
 
-    # Action mapping
+    # Optional cap
+    # final_score = min(final_score, 100)
+
     if final_score >= 80:
         action = "🔥 STRONG BUY"
     elif final_score >= 65:
